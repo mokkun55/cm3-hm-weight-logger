@@ -1,10 +1,10 @@
 # CM3-HM Auto Weight Logger
 
-チョコザップ体重計 `CM3-HM` のBLE広告を Seeed Studio XIAO ESP32C3 で受信し、体重をDiscordとGoogle Sheetsへ自動記録するファームウェアです。
+チョコザップ体重計 `CM3-HM` のBLE広告を Seeed Studio XIAO ESP32C3 で受け取り、体重をDiscordとGoogle Sheetsへ自動記録するファームウェアです。
 
 ## 概要
 
-体重計に乗ると、ESP32-C3が `CM3-HM` のBLE advertisementを監視して測定完了を検出します。測定値を推定したあと、Wi-Fi経由でDiscord Webhookへ通知し、Google Apps Script経由でGoogle Sheetsへ追記します。
+体重計に乗ると、ESP32-C3が `CM3-HM` のBLE広告を検出します。manufacturer dataから測定完了を推定し、測定値が取れたらWi-Fiを起動してDiscord Webhookへ通知し、Google Apps Script経由でGoogle Sheetsへ追記します。送信が終わるとWi-Fiはすぐに停止します。
 
 ```text
 CM3-HM scale
@@ -27,6 +27,7 @@ CM3-HM scale
 
 - `CM3-HM` の公式BLE仕様は未公開のため、この実装は実測ログから推定したプロトコルに基づきます。
 - 体重変換式は現時点で 74.8kg / 76.9kg / 77.7kg 付近のサンプルから作った暫定キャリブレーションです。
+- 待機時の発熱を抑えるため、BLEは passive scan、Wi-Fi は送信時だけ有効にしています。
 - `src/secrets.h` にはWi-FiパスワードやWebhook URLを入れるため、Git管理対象外です。
 - Appleヘルスケア連携は未実装です。HealthKitへ書くにはiPhoneアプリやショートカットなど、iOS側の処理が必要です。
 
@@ -74,6 +75,22 @@ arduino-cli board list
 
 PlatformIOを使う場合は、このリポジトリをVS Codeで開いてUploadします。`platformio.ini` では `huge_app.csv` パーティションを使います。
 
+### 3. BLEスキャン設定
+
+`src/main.cpp` では待機時の発熱を抑えるため、BLEスキャンを軽めに設定しています。
+
+```cpp
+constexpr int SCAN_INTERVAL = 320;
+constexpr int SCAN_WINDOW = 40;
+constexpr bool ACTIVE_SCAN = false;
+```
+
+- `ACTIVE_SCAN = false`: passive scan で追加応答を取りにいかない
+- `SCAN_INTERVAL = 320`
+- `SCAN_WINDOW = 40`
+
+検出率を優先したくなったら、まず `SCAN_WINDOW` を少し戻して調整してください。
+
 ## Discord通知
 
 Discord側でWebhook URLを作り、`DISCORD_WEBHOOK_URL` に設定します。
@@ -114,6 +131,8 @@ Google Sheetsへは、ESP32からSheets APIを直接叩かず、Google Apps Scri
 timestamp, weight_kg, raw_be, stable_payload, live_payload, device
 ```
 
+`device` 列には `CM3-HM/ADV` のように取得元が入ります。
+
 ## 通常ログ
 
 通常時のシリアルログは必要最小限です。
@@ -121,11 +140,16 @@ timestamp, weight_kg, raw_be, stable_payload, live_payload, device
 ```text
 CM3-HM auto weight logger
 Serial: 115200 baud
+BLE transport mode: advertisement-only
+BLE scan mode: passive interval=320 window=40
+WiFi stays off until a measurement is ready to upload.
 Step on the scale. Measurement summaries are printed.
+MEASUREMENT_COMPLETE source=advertisement estimated_weight_kg=76.9 raw=11660
+WiFi connecting to YOUR_WIFI_SSID
 WiFi connected, ip=192.168.2.188
-MEASUREMENT_COMPLETE estimated_weight_kg=74.5
 Sheets sent: row=4
 Discord sent
+WiFi disconnecting
 ```
 
 ## デバッグ

@@ -17,8 +17,10 @@ constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 30000;
 constexpr uint32_t NOTIFICATION_DEBOUNCE_MS = 120000;
 constexpr uint32_t HTTP_TIMEOUT_MS = 15000;
-constexpr int SCAN_INTERVAL = 160;
-constexpr int SCAN_WINDOW = 80;
+constexpr uint32_t LIVE_MEASUREMENT_MAX_AGE_MS = 10000;
+constexpr int SCAN_INTERVAL = 320;
+constexpr int SCAN_WINDOW = 40;
+constexpr bool ACTIVE_SCAN = false;
 constexpr bool DEBUG_BLE_PACKETS = false;
 constexpr bool DEBUG_HTTP = false;
 
@@ -32,30 +34,59 @@ constexpr float CALIBRATION_KG_PER_RAW_STEP = 2.9f / 11.0f;
 
 BLEScan *scanner = nullptr;
 String lastManufacturerDataHex;
-uint32_t lastRepeatedLogMillis = 0;
 String lastLivePayloadHex;
-uint16_t lastLiveRawBe = 0;
 String lastAnnouncedStablePayloadHex;
-uint16_t lastNotifiedRawBe = 0;
+uint32_t lastRepeatedLogMillis = 0;
 uint32_t lastNotificationMillis = 0;
 uint32_t lastWifiAttemptMillis = 0;
+uint32_t lastLiveMeasurementMillis = 0;
+uint16_t lastLiveRawBe = 0;
+uint16_t lastNotifiedRawValue = 0;
 
 struct Measurement {
   bool pending = false;
   float weightKg = 0.0f;
-  uint16_t rawBe = 0;
+  uint16_t rawValue = 0;
   String stablePayloadHex;
   String livePayloadHex;
+  String device = "CM3-HM/ADV";
+  String source = "advertisement";
 };
 
 Measurement pendingMeasurement;
 
-String bytesToHex(const String &bytes) {
+String bytesToHex(const uint8_t *data, size_t length) {
   String out;
-  out.reserve(bytes.length() * 3);
+  out.reserve(length * 3);
 
-  for (size_t i = 0; i < bytes.length(); i++) {
+  for (size_t i = 0; i < length; i++) {
     if (i > 0) {
+      out += ' ';
+    }
+
+    char buf[3];
+    snprintf(buf, sizeof(buf), "%02X", data[i]);
+    out += buf;
+  }
+
+  return out;
+}
+
+String bytesToHex(const String &bytes) {
+  return bytesToHex(reinterpret_cast<const uint8_t *>(bytes.c_str()),
+                    bytes.length());
+}
+
+String bytesSliceToHex(const String &bytes, size_t start) {
+  if (start >= bytes.length()) {
+    return "(none)";
+  }
+
+  String out;
+  out.reserve((bytes.length() - start) * 3);
+
+  for (size_t i = start; i < bytes.length(); i++) {
+    if (i > start) {
       out += ' ';
     }
 
@@ -129,27 +160,6 @@ void printSheetsConfigStatus() {
       static_cast<unsigned>(strlen(SHEETS_TOKEN)));
 }
 
-String bytesSliceToHex(const String &bytes, size_t start) {
-  if (start >= bytes.length()) {
-    return "(none)";
-  }
-
-  String out;
-  out.reserve((bytes.length() - start) * 3);
-
-  for (size_t i = start; i < bytes.length(); i++) {
-    if (i > start) {
-      out += ' ';
-    }
-
-    char buf[3];
-    snprintf(buf, sizeof(buf), "%02X", static_cast<uint8_t>(bytes[i]));
-    out += buf;
-  }
-
-  return out;
-}
-
 bool isLikelyStableMeasurement(const String &manufacturerData) {
   return manufacturerData.length() == 14 &&
          static_cast<uint8_t>(manufacturerData[8]) == 0xA2;
@@ -184,38 +194,51 @@ void rememberMeasurementState(const String &manufacturerData) {
   if (isLikelyLiveMeasurement(manufacturerData)) {
     lastLivePayloadHex = bytesSliceToHex(manufacturerData, 8);
     lastLiveRawBe = readPayloadRawBe(manufacturerData);
+    lastLiveMeasurementMillis = millis();
   }
 }
 
-bool shouldAnnounceMeasurement(const String &stablePayloadHex, uint16_t rawBe) {
+bool shouldAnnounceMeasurement(const String &stablePayloadHex,
+                               uint16_t rawValue) {
   const uint32_t now = millis();
   if (stablePayloadHex != lastAnnouncedStablePayloadHex) {
     return true;
   }
 
-  if (rawBe != lastNotifiedRawBe) {
+  if (rawValue != lastNotifiedRawValue) {
     return true;
   }
 
   return now - lastNotificationMillis >= NOTIFICATION_DEBOUNCE_MS;
 }
 
-void queueMeasurement(float weightKg, uint16_t rawBe,
+void queueMeasurement(float weightKg, uint16_t rawValue,
                       const String &stablePayloadHex,
                       const String &livePayloadHex) {
   pendingMeasurement.pending = true;
   pendingMeasurement.weightKg = weightKg;
-  pendingMeasurement.rawBe = rawBe;
+  pendingMeasurement.rawValue = rawValue;
   pendingMeasurement.stablePayloadHex = stablePayloadHex;
   pendingMeasurement.livePayloadHex = livePayloadHex;
+  pendingMeasurement.device = "CM3-HM/ADV";
+  pendingMeasurement.source = "advertisement";
 
   lastAnnouncedStablePayloadHex = stablePayloadHex;
-  lastNotifiedRawBe = rawBe;
+  lastNotifiedRawValue = rawValue;
   lastNotificationMillis = millis();
+}
+
+bool hasFreshAdvertisementLiveMeasurement() {
+  return lastLiveRawBe != 0 && lastLiveMeasurementMillis != 0 &&
+         millis() - lastLiveMeasurementMillis < LIVE_MEASUREMENT_MAX_AGE_MS;
 }
 
 void handleStableMeasurement(const String &manufacturerData) {
   if (!isLikelyStableMeasurement(manufacturerData)) {
+    return;
+  }
+
+  if (!hasFreshAdvertisementLiveMeasurement()) {
     return;
   }
 
@@ -227,7 +250,10 @@ void handleStableMeasurement(const String &manufacturerData) {
   const float weightKg = estimateWeightKg(lastLiveRawBe);
   queueMeasurement(weightKg, lastLiveRawBe, stablePayloadHex, lastLivePayloadHex);
 
-  Serial.printf("MEASUREMENT_COMPLETE estimated_weight_kg=%.1f\n", weightKg);
+  Serial.printf(
+      "MEASUREMENT_COMPLETE source=advertisement estimated_weight_kg=%.1f "
+      "raw=%u\n",
+      weightKg, lastLiveRawBe);
 
   if (DEBUG_HTTP) {
     Serial.printf(
@@ -237,6 +263,273 @@ void handleStableMeasurement(const String &manufacturerData) {
         lastLivePayloadHex.length() > 0 ? lastLivePayloadHex.c_str() : "(none)",
         lastLiveRawBe);
   }
+}
+
+void disconnectWiFi() {
+  if (WiFi.getMode() == WIFI_OFF) {
+    lastWifiAttemptMillis = 0;
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi disconnecting");
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  lastWifiAttemptMillis = 0;
+}
+
+void connectWiFiIfNeeded() {
+  if (!wifiConfigured()) {
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (lastWifiAttemptMillis != 0 &&
+      now - lastWifiAttemptMillis < WIFI_RETRY_INTERVAL_MS) {
+    return;
+  }
+  lastWifiAttemptMillis = now;
+
+  Serial.printf("WiFi connecting to %s\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  const uint32_t startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi connected, ip=%s\n", WiFi.localIP().toString().c_str());
+    lastWifiAttemptMillis = 0;
+  } else {
+    Serial.println("WiFi connection failed");
+    disconnectWiFi();
+  }
+}
+
+String buildDiscordJson(const Measurement &measurement) {
+  String payload =
+      "{\"content\":\"もっくんが体重を測りました！\\n体重: ";
+  payload += String(measurement.weightKg, 1);
+  payload += "kg\"}";
+  return payload;
+}
+
+bool postJson(const char *label, const char *url, const String &json,
+              String *responseBody = nullptr) {
+  connectWiFiIfNeeded();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("%s skipped: WiFi is not connected\n", label);
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) {
+    Serial.printf("%s failed: could not begin HTTP request\n", label);
+    return false;
+  }
+
+  if (DEBUG_HTTP) {
+    Serial.printf("%s POST start: payload_bytes=%u\n", label,
+                  static_cast<unsigned>(json.length()));
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  const int statusCode = http.POST(json);
+  const String body = http.getString();
+  if (DEBUG_HTTP) {
+    Serial.printf("%s POST finished: status=%d\n", label, statusCode);
+  }
+  if (responseBody != nullptr) {
+    *responseBody = body;
+  }
+
+  if (statusCode >= 200 && statusCode < 300) {
+    if (DEBUG_HTTP) {
+      Serial.printf("%s HTTP ok: status=%d response_bytes=%u\n", label,
+                    statusCode, static_cast<unsigned>(body.length()));
+    }
+    http.end();
+    return true;
+  }
+
+  Serial.printf("%s failed: status=%d body=%s\n", label, statusCode,
+                body.c_str());
+  http.end();
+  return false;
+}
+
+String urlEncode(const String &value) {
+  String encoded;
+  encoded.reserve(value.length() * 3);
+
+  for (size_t i = 0; i < value.length(); i++) {
+    const char c = value[i];
+    if (isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' ||
+        c == '.' || c == '~') {
+      encoded += c;
+    } else {
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%%%02X", static_cast<uint8_t>(c));
+      encoded += buf;
+    }
+  }
+
+  return encoded;
+}
+
+bool getUrl(const char *label, const String &url,
+            String *responseBody = nullptr) {
+  connectWiFiIfNeeded();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("%s skipped: WiFi is not connected\n", label);
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) {
+    Serial.printf("%s failed: could not begin HTTP GET\n", label);
+    return false;
+  }
+
+  if (DEBUG_HTTP) {
+    Serial.printf("%s GET start: url_bytes=%u\n", label,
+                  static_cast<unsigned>(url.length()));
+  }
+
+  const int statusCode = http.GET();
+  const String body = http.getString();
+  if (DEBUG_HTTP) {
+    Serial.printf("%s GET finished: status=%d response_bytes=%u\n", label,
+                  statusCode, static_cast<unsigned>(body.length()));
+  }
+
+  if (responseBody != nullptr) {
+    *responseBody = body;
+  }
+
+  if (statusCode >= 200 && statusCode < 300) {
+    http.end();
+    return true;
+  }
+
+  Serial.printf("%s failed: status=%d body=%s\n", label, statusCode,
+                body.c_str());
+  http.end();
+  return false;
+}
+
+bool sendDiscordWebhook(const Measurement &measurement) {
+  if (!discordConfigured()) {
+    Serial.println("Discord skipped: src/secrets.h is not configured");
+    return false;
+  }
+
+  if (!postJson("Discord", DISCORD_WEBHOOK_URL, buildDiscordJson(measurement))) {
+    return false;
+  }
+
+  Serial.println("Discord sent");
+  return true;
+}
+
+String buildSheetsUrl(const Measurement &measurement) {
+  String url = SHEETS_WEBHOOK_URL;
+  url += "?token=";
+  url += urlEncode(SHEETS_TOKEN);
+  url += "&weightKg=";
+  url += urlEncode(String(measurement.weightKg, 1));
+  url += "&rawBe=";
+  url += urlEncode(String(measurement.rawValue));
+  url += "&stablePayload=";
+  url += urlEncode(measurement.stablePayloadHex);
+  url += "&livePayload=";
+  url += urlEncode(measurement.livePayloadHex);
+  url += "&device=";
+  url += urlEncode(measurement.device);
+  return url;
+}
+
+bool sendSheetsWebhook(const Measurement &measurement) {
+  if (!sheetsConfigured()) {
+    Serial.println("Sheets skipped: src/secrets.h is not configured");
+    printSheetsConfigStatus();
+    return false;
+  }
+
+  if (DEBUG_HTTP) {
+    Serial.printf(
+        "Sheets request: weight=%.1f raw=%u stable=\"%s\" live=\"%s\" "
+        "device=\"%s\"\n",
+        measurement.weightKg, measurement.rawValue,
+        measurement.stablePayloadHex.c_str(),
+        measurement.livePayloadHex.c_str(), measurement.device.c_str());
+  }
+
+  String body;
+  const String url = buildSheetsUrl(measurement);
+  if (!getUrl("Sheets", url, &body)) {
+    return false;
+  }
+
+  if (body.indexOf("\"ok\":true") < 0) {
+    Serial.printf("Sheets failed: body=%s\n", body.c_str());
+    return false;
+  }
+
+  const int rowIndex = body.indexOf("\"row\":");
+  if (rowIndex >= 0) {
+    const int rowStart = rowIndex + 6;
+    const int rowEndComma = body.indexOf(',', rowStart);
+    const int rowEndBrace = body.indexOf('}', rowStart);
+    int rowEnd = body.length();
+    if (rowEndComma >= 0) {
+      rowEnd = rowEndComma;
+    } else if (rowEndBrace >= 0) {
+      rowEnd = rowEndBrace;
+    }
+    Serial.printf("Sheets sent: row=%s\n",
+                  body.substring(rowStart, rowEnd).c_str());
+  } else {
+    Serial.println("Sheets sent");
+  }
+
+  if (DEBUG_HTTP) {
+    Serial.printf("Sheets response: %s\n", body.c_str());
+  }
+  return true;
+}
+
+void processPendingMeasurement() {
+  if (!pendingMeasurement.pending) {
+    return;
+  }
+
+  Measurement measurement = pendingMeasurement;
+  pendingMeasurement.pending = false;
+  sendSheetsWebhook(measurement);
+  sendDiscordWebhook(measurement);
+  disconnectWiFi();
 }
 
 void printPacketSummary(BLEAdvertisedDevice &device,
@@ -320,269 +613,9 @@ void setupScanner() {
   scanner = BLEDevice::getScan();
   scanner->setAdvertisedDeviceCallbacks(new ScaleAdvertisedDeviceCallbacks(),
                                         true);
-
-  // Passive scan is enough for non-connectable advertisements and avoids
-  // changing the scale's behavior while we are reverse-engineering packets.
-  scanner->setActiveScan(false);
+  scanner->setActiveScan(ACTIVE_SCAN);
   scanner->setInterval(SCAN_INTERVAL);
   scanner->setWindow(SCAN_WINDOW);
-}
-
-void connectWiFiIfNeeded() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
-
-  const uint32_t now = millis();
-  if (lastWifiAttemptMillis != 0 &&
-      now - lastWifiAttemptMillis < WIFI_RETRY_INTERVAL_MS) {
-    return;
-  }
-  lastWifiAttemptMillis = now;
-
-  Serial.printf("WiFi connecting to %s\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  const uint32_t startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(250);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("WiFi connected, ip=%s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("WiFi connection failed");
-  }
-}
-
-String buildDiscordJson(const Measurement &measurement) {
-  String payload =
-      "{\"content\":\"もっくんが体重を測りました！\\n体重: ";
-  payload += String(measurement.weightKg, 1);
-  payload += "kg\"}";
-  return payload;
-}
-
-bool postJson(const char *label, const char *url, const String &json,
-              String *responseBody = nullptr) {
-  connectWiFiIfNeeded();
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("%s skipped: WiFi is not connected\n", label);
-    return false;
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) {
-    Serial.printf("%s failed: could not begin HTTP request\n", label);
-    return false;
-  }
-
-  if (DEBUG_HTTP) {
-    Serial.printf("%s POST start: payload_bytes=%u\n", label,
-                  static_cast<unsigned>(json.length()));
-  }
-
-  http.addHeader("Content-Type", "application/json");
-  const int statusCode = http.POST(json);
-  const String body = http.getString();
-  if (DEBUG_HTTP) {
-    Serial.printf("%s POST finished: status=%d\n", label, statusCode);
-  }
-  if (responseBody != nullptr) {
-    *responseBody = body;
-  }
-
-  if (statusCode >= 200 && statusCode < 300) {
-    if (DEBUG_HTTP) {
-      Serial.printf("%s HTTP ok: status=%d response_bytes=%u\n", label,
-                    statusCode, static_cast<unsigned>(body.length()));
-    }
-    http.end();
-    return true;
-  }
-
-  Serial.printf("%s failed: status=%d body=%s\n", label, statusCode,
-                body.c_str());
-  http.end();
-  return false;
-}
-
-String urlEncode(const String &value) {
-  String encoded;
-  encoded.reserve(value.length() * 3);
-
-  for (size_t i = 0; i < value.length(); i++) {
-    const char c = value[i];
-    if (isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' ||
-        c == '.' || c == '~') {
-      encoded += c;
-    } else {
-      char buf[4];
-      snprintf(buf, sizeof(buf), "%%%02X", static_cast<uint8_t>(c));
-      encoded += buf;
-    }
-  }
-
-  return encoded;
-}
-
-bool getUrl(const char *label, const String &url, String *responseBody = nullptr) {
-  connectWiFiIfNeeded();
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("%s skipped: WiFi is not connected\n", label);
-    return false;
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) {
-    Serial.printf("%s failed: could not begin HTTP GET\n", label);
-    return false;
-  }
-
-  if (DEBUG_HTTP) {
-    Serial.printf("%s GET start: url_bytes=%u\n", label,
-                  static_cast<unsigned>(url.length()));
-  }
-
-  const int statusCode = http.GET();
-  const String body = http.getString();
-  if (DEBUG_HTTP) {
-    Serial.printf("%s GET finished: status=%d response_bytes=%u\n", label,
-                  statusCode, static_cast<unsigned>(body.length()));
-  }
-
-  if (responseBody != nullptr) {
-    *responseBody = body;
-  }
-
-  if (statusCode >= 200 && statusCode < 300) {
-    http.end();
-    return true;
-  }
-
-  Serial.printf("%s failed: status=%d body=%s\n", label, statusCode,
-                body.c_str());
-  http.end();
-  return false;
-}
-
-bool sendDiscordWebhook(const Measurement &measurement) {
-  if (!discordConfigured()) {
-    Serial.println("Discord skipped: src/secrets.h is not configured");
-    return false;
-  }
-
-  if (!postJson("Discord", DISCORD_WEBHOOK_URL, buildDiscordJson(measurement))) {
-    return false;
-  }
-
-  Serial.println("Discord sent");
-  return true;
-}
-
-String buildSheetsJson(const Measurement &measurement) {
-  String payload = "{\"token\":\"";
-  payload += SHEETS_TOKEN;
-  payload += "\",\"weightKg\":";
-  payload += String(measurement.weightKg, 1);
-  payload += ",\"rawBe\":";
-  payload += String(measurement.rawBe);
-  payload += ",\"stablePayload\":\"";
-  payload += measurement.stablePayloadHex;
-  payload += "\",\"livePayload\":\"";
-  payload += measurement.livePayloadHex;
-  payload += "\",\"device\":\"CM3-HM\"}";
-  return payload;
-}
-
-String buildSheetsUrl(const Measurement &measurement) {
-  String url = SHEETS_WEBHOOK_URL;
-  url += "?token=";
-  url += urlEncode(SHEETS_TOKEN);
-  url += "&weightKg=";
-  url += urlEncode(String(measurement.weightKg, 1));
-  url += "&rawBe=";
-  url += urlEncode(String(measurement.rawBe));
-  url += "&stablePayload=";
-  url += urlEncode(measurement.stablePayloadHex);
-  url += "&livePayload=";
-  url += urlEncode(measurement.livePayloadHex);
-  url += "&device=CM3-HM";
-  return url;
-}
-
-bool sendSheetsWebhook(const Measurement &measurement) {
-  if (!sheetsConfigured()) {
-    Serial.println("Sheets skipped: src/secrets.h is not configured");
-    printSheetsConfigStatus();
-    return false;
-  }
-
-  if (DEBUG_HTTP) {
-    Serial.printf(
-        "Sheets request: weight=%.1f raw=%u stable=\"%s\" live=\"%s\"\n",
-        measurement.weightKg, measurement.rawBe,
-        measurement.stablePayloadHex.c_str(),
-        measurement.livePayloadHex.c_str());
-  }
-
-  String body;
-  const String url = buildSheetsUrl(measurement);
-  if (!getUrl("Sheets", url, &body)) {
-    return false;
-  }
-
-  if (body.indexOf("\"ok\":true") < 0) {
-    Serial.printf("Sheets failed: body=%s\n", body.c_str());
-    return false;
-  }
-
-  const int rowIndex = body.indexOf("\"row\":");
-  if (rowIndex >= 0) {
-    const int rowStart = rowIndex + 6;
-    const int rowEndComma = body.indexOf(',', rowStart);
-    const int rowEndBrace = body.indexOf('}', rowStart);
-    int rowEnd = body.length();
-    if (rowEndComma >= 0) {
-      rowEnd = rowEndComma;
-    } else if (rowEndBrace >= 0) {
-      rowEnd = rowEndBrace;
-    }
-    Serial.printf("Sheets sent: row=%s\n",
-                  body.substring(rowStart, rowEnd).c_str());
-  } else {
-    Serial.println("Sheets sent");
-  }
-
-  if (DEBUG_HTTP) {
-    Serial.printf("Sheets response: %s\n", body.c_str());
-  }
-  return true;
-}
-
-void processPendingMeasurement() {
-  if (!pendingMeasurement.pending) {
-    return;
-  }
-
-  Measurement measurement = pendingMeasurement;
-  pendingMeasurement.pending = false;
-  sendSheetsWebhook(measurement);
-  sendDiscordWebhook(measurement);
 }
 
 }  // namespace
@@ -595,20 +628,21 @@ void setup() {
   Serial.println("CM3-HM auto weight logger");
   Serial.println("Serial: 115200 baud");
   Serial.println("Step on the scale. Measurement summaries are printed.");
-  if (DEBUG_BLE_PACKETS) {
-    Serial.println(
-        "BLE packet debug is enabled: data=<full manufacturer data>, "
-        "payload=<last 6 bytes>");
-  }
+  Serial.println("BLE transport mode: advertisement-only");
+  Serial.printf("BLE scan mode: %s interval=%d window=%d\n",
+                ACTIVE_SCAN ? "active" : "passive", SCAN_INTERVAL,
+                SCAN_WINDOW);
+  Serial.println("WiFi stays off until a measurement is ready to upload.");
   Serial.println("Weight estimate is provisional and based on 3 samples.");
   printSheetsConfigStatus();
-  if (discordConfigured() || sheetsConfigured()) {
-    connectWiFiIfNeeded();
-  } else {
+  if (!discordConfigured()) {
     Serial.println("Discord disabled until src/secrets.h is configured.");
+  }
+  if (!sheetsConfigured()) {
     Serial.println("Sheets disabled until src/secrets.h is configured.");
   }
 
+  disconnectWiFi();
   setupScanner();
 }
 
