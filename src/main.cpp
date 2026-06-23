@@ -3,7 +3,9 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEUtils.h>
+#include <esp_sleep.h>
 #include <HTTPClient.h>
+#include <time.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
@@ -18,11 +20,21 @@ constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 30000;
 constexpr uint32_t NOTIFICATION_DEBOUNCE_MS = 120000;
 constexpr uint32_t HTTP_TIMEOUT_MS = 15000;
 constexpr uint32_t LIVE_MEASUREMENT_MAX_AGE_MS = 10000;
+constexpr uint32_t SLEEP_SCHEDULE_CHECK_INTERVAL_MS = 60000;
+constexpr uint32_t CLOCK_SYNC_TIMEOUT_MS = 15000;
+constexpr uint32_t CLOCK_RESYNC_INTERVAL_SECONDS = 12 * 60 * 60;
 constexpr int SCAN_INTERVAL = 320;
 constexpr int SCAN_WINDOW = 40;
+constexpr int SLEEP_START_HOUR_JST = 23;
+constexpr int SLEEP_END_HOUR_JST = 6;
 constexpr bool ACTIVE_SCAN = false;
 constexpr bool DEBUG_BLE_PACKETS = false;
 constexpr bool DEBUG_HTTP = false;
+constexpr time_t MIN_VALID_UNIX_TIME = 1704067200;  // 2024-01-01 00:00:00 UTC
+constexpr const char *JST_TIME_ZONE = "JST-9";
+constexpr const char *NTP_SERVER_PRIMARY = "ntp.nict.jp";
+constexpr const char *NTP_SERVER_SECONDARY = "time.google.com";
+constexpr const char *NTP_SERVER_TERTIARY = "pool.ntp.org";
 
 // Temporary calibration from observed samples:
 // 74.8 kg -> raw 11652, 77.7 kg -> raw 11663.
@@ -40,8 +52,10 @@ uint32_t lastRepeatedLogMillis = 0;
 uint32_t lastNotificationMillis = 0;
 uint32_t lastWifiAttemptMillis = 0;
 uint32_t lastLiveMeasurementMillis = 0;
+uint32_t lastSleepScheduleCheckMillis = 0;
 uint16_t lastLiveRawBe = 0;
 uint16_t lastNotifiedRawValue = 0;
+RTC_DATA_ATTR time_t lastClockSyncEpoch = 0;
 
 struct Measurement {
   bool pending = false;
@@ -54,6 +68,56 @@ struct Measurement {
 };
 
 Measurement pendingMeasurement;
+
+bool clockLooksSynchronized(time_t now) {
+  return now >= MIN_VALID_UNIX_TIME;
+}
+
+bool currentLocalTime(struct tm *out) {
+  if (out == nullptr) {
+    return false;
+  }
+
+  const time_t now = time(nullptr);
+  if (!clockLooksSynchronized(now)) {
+    return false;
+  }
+
+  return localtime_r(&now, out) != nullptr;
+}
+
+bool isSleepWindow(const struct tm &localTime) {
+  return localTime.tm_hour >= SLEEP_START_HOUR_JST ||
+         localTime.tm_hour < SLEEP_END_HOUR_JST;
+}
+
+uint64_t secondsUntilSleepEnds(const struct tm &localTime) {
+  struct tm nowCopy = localTime;
+  struct tm wakeTime = localTime;
+  wakeTime.tm_hour = SLEEP_END_HOUR_JST;
+  wakeTime.tm_min = 0;
+  wakeTime.tm_sec = 0;
+
+  if (localTime.tm_hour >= SLEEP_START_HOUR_JST) {
+    wakeTime.tm_mday += 1;
+  }
+
+  const time_t nowEpoch = mktime(&nowCopy);
+  time_t wakeEpoch = mktime(&wakeTime);
+  if (wakeEpoch <= nowEpoch) {
+    wakeTime.tm_mday += 1;
+    wakeEpoch = mktime(&wakeTime);
+  }
+
+  return wakeEpoch > nowEpoch ? static_cast<uint64_t>(wakeEpoch - nowEpoch) : 0;
+}
+
+void logLocalTime(const char *label, const struct tm &localTime) {
+  Serial.printf("%s: %04d-%02d-%02d %02d:%02d:%02d JST\n", label,
+                localTime.tm_year + 1900, localTime.tm_mon + 1,
+                localTime.tm_mday, localTime.tm_hour, localTime.tm_min,
+                localTime.tm_sec);
+}
 
 String bytesToHex(const uint8_t *data, size_t length) {
   String out;
@@ -315,6 +379,93 @@ void connectWiFiIfNeeded() {
     Serial.println("WiFi connection failed");
     disconnectWiFi();
   }
+}
+
+bool syncClockIfNeeded(bool force) {
+  const time_t now = time(nullptr);
+  if (!force && clockLooksSynchronized(now) && lastClockSyncEpoch != 0 &&
+      now - lastClockSyncEpoch < CLOCK_RESYNC_INTERVAL_SECONDS) {
+    return true;
+  }
+
+  if (!wifiConfigured()) {
+    Serial.println("Clock sync skipped: WiFi is not configured");
+    return false;
+  }
+
+  connectWiFiIfNeeded();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Clock sync skipped: WiFi is not connected");
+    return false;
+  }
+
+  configTzTime(JST_TIME_ZONE, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY,
+               NTP_SERVER_TERTIARY);
+
+  struct tm localTime;
+  const uint32_t startedAt = millis();
+  while (millis() - startedAt < CLOCK_SYNC_TIMEOUT_MS) {
+    if (getLocalTime(&localTime, 250)) {
+      lastClockSyncEpoch = time(nullptr);
+      logLocalTime("Clock synchronized", localTime);
+      return true;
+    }
+  }
+
+  Serial.println("Clock sync failed");
+  return false;
+}
+
+void enterDeepSleepUntilMorning(const struct tm &localTime) {
+  const uint64_t sleepSeconds = secondsUntilSleepEnds(localTime);
+  Serial.printf("Deep sleep scheduled: now=%02d:%02d:%02d wake_at=%02d:00 "
+                "sleep_seconds=%llu\n",
+                localTime.tm_hour, localTime.tm_min, localTime.tm_sec,
+                SLEEP_END_HOUR_JST,
+                static_cast<unsigned long long>(sleepSeconds));
+
+  disconnectWiFi();
+
+  if (sleepSeconds == 0) {
+    Serial.println("Deep sleep skipped: wake time is immediate");
+    return;
+  }
+
+  esp_sleep_enable_timer_wakeup(sleepSeconds * 1000000ULL);
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+void enforceSleepSchedule(bool forceClockSync) {
+  if (!forceClockSync) {
+    const uint32_t nowMillis = millis();
+    if (lastSleepScheduleCheckMillis != 0 &&
+        nowMillis - lastSleepScheduleCheckMillis <
+            SLEEP_SCHEDULE_CHECK_INTERVAL_MS) {
+      return;
+    }
+    lastSleepScheduleCheckMillis = nowMillis;
+  }
+
+  if (!clockLooksSynchronized(time(nullptr)) && !syncClockIfNeeded(true)) {
+    return;
+  }
+
+  if (!syncClockIfNeeded(false)) {
+    return;
+  }
+
+  struct tm localTime;
+  if (!currentLocalTime(&localTime)) {
+    Serial.println("Sleep schedule skipped: local time is unavailable");
+    return;
+  }
+
+  if (!isSleepWindow(localTime)) {
+    return;
+  }
+
+  enterDeepSleepUntilMorning(localTime);
 }
 
 String buildDiscordJson(const Measurement &measurement) {
@@ -633,6 +784,8 @@ void setup() {
                 ACTIVE_SCAN ? "active" : "passive", SCAN_INTERVAL,
                 SCAN_WINDOW);
   Serial.println("WiFi stays off until a measurement is ready to upload.");
+  Serial.printf("Deep sleep schedule: JST %02d:00-%02d:00\n",
+                SLEEP_START_HOUR_JST, SLEEP_END_HOUR_JST);
   Serial.println("Weight estimate is provisional and based on 3 samples.");
   printSheetsConfigStatus();
   if (!discordConfigured()) {
@@ -643,12 +796,17 @@ void setup() {
   }
 
   disconnectWiFi();
+  enforceSleepSchedule(true);
+  disconnectWiFi();
   setupScanner();
 }
 
 void loop() {
+  processPendingMeasurement();
+  enforceSleepSchedule(false);
   scanner->start(SCAN_SECONDS, false);
   scanner->clearResults();
   processPendingMeasurement();
+  enforceSleepSchedule(false);
   delay(500);
 }

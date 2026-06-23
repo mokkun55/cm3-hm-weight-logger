@@ -4,7 +4,7 @@
 
 ## 概要
 
-体重計に乗ると、ESP32-C3が `CM3-HM` のBLE広告を検出します。manufacturer dataから測定完了を推定し、測定値が取れたらWi-Fiを起動してDiscord Webhookへ通知し、Google Apps Script経由でGoogle Sheetsへ追記します。送信が終わるとWi-Fiはすぐに停止します。
+体重計に乗ると、ESP32-C3が `CM3-HM` のBLE広告を検出します。manufacturer dataから測定完了を推定し、測定値が取れたらWi-Fiを起動してDiscord Webhookへ通知し、Google Apps Script経由でGoogle Sheetsへ追記します。送信が終わるとWi-Fiはすぐに停止します。日本時間の `23:00-06:00` は deep sleep に入り、起床は `06:00` です。
 
 ```text
 CM3-HM scale
@@ -28,6 +28,7 @@ CM3-HM scale
 - `CM3-HM` の公式BLE仕様は未公開のため、この実装は実測ログから推定したプロトコルに基づきます。
 - 体重変換式は現時点で 74.8kg / 76.9kg / 77.7kg 付近のサンプルから作った暫定キャリブレーションです。
 - 待機時の発熱を抑えるため、BLEは passive scan、Wi-Fi は送信時だけ有効にしています。
+- deep sleep の時刻判定には NTP で JST を同期するため、起動直後や時刻再同期時には一時的に Wi-Fi を使います。
 - `src/secrets.h` にはWi-FiパスワードやWebhook URLを入れるため、Git管理対象外です。
 - Appleヘルスケア連携は未実装です。HealthKitへ書くにはiPhoneアプリやショートカットなど、iOS側の処理が必要です。
 
@@ -91,6 +92,15 @@ constexpr bool ACTIVE_SCAN = false;
 
 検出率を優先したくなったら、まず `SCAN_WINDOW` を少し戻して調整してください。
 
+### 4. 深夜の deep sleep
+
+`src/main.cpp` では、日本時間の `23:00-06:00` を deep sleep 時間帯として扱います。
+
+- 起動時に NTP で JST を同期する
+- `23:00` 以降または `06:00` 前に起動した場合は、そのまま `06:00` まで deep sleep
+- 日中に起動している間も 1 分ごとに時刻を確認し、`23:00` を過ぎたら deep sleep
+- deep sleep からの復帰後は通常どおり再起動シーケンスに入る
+
 ## Discord通知
 
 Discord側でWebhook URLを作り、`DISCORD_WEBHOOK_URL` に設定します。
@@ -143,13 +153,28 @@ Serial: 115200 baud
 BLE transport mode: advertisement-only
 BLE scan mode: passive interval=320 window=40
 WiFi stays off until a measurement is ready to upload.
+Deep sleep schedule: JST 23:00-06:00
 Step on the scale. Measurement summaries are printed.
+Clock synchronized: 2026-06-23 22:58:01 JST
 MEASUREMENT_COMPLETE source=advertisement estimated_weight_kg=76.9 raw=11660
 WiFi connecting to YOUR_WIFI_SSID
 WiFi connected, ip=192.168.2.188
 Sheets sent: row=4
 Discord sent
 WiFi disconnecting
+```
+
+深夜に起動した場合は、次のようなログになります。
+
+```text
+CM3-HM auto weight logger
+Serial: 115200 baud
+BLE transport mode: advertisement-only
+BLE scan mode: passive interval=320 window=40
+WiFi stays off until a measurement is ready to upload.
+Deep sleep schedule: JST 23:00-06:00
+Clock synchronized: 2026-06-23 23:10:04 JST
+Deep sleep scheduled: now=23:10:04 wake_at=06:00 sleep_seconds=24596
 ```
 
 ## デバッグ
