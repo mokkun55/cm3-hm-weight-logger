@@ -4,7 +4,7 @@
 
 ## 概要
 
-体重計に乗ると、ESP32-C3が `CM3-HM` のBLE広告を検出します。manufacturer dataから測定完了を推定し、測定値が取れたらWi-Fiを起動してDiscord Webhookへ通知し、Google Apps Script経由でGoogle Sheetsへ追記します。送信が終わるとWi-Fiはすぐに停止します。日本時間の `23:00-06:00` は deep sleep に入り、起床は `06:00` です。
+体重計に乗ると、ESP32-C3が `CM3-HM` のBLE広告を検出します。manufacturer dataから測定完了を推定し、測定値が取れたらWi-Fiを起動してDiscord Webhookへ通知し、Google Apps Script経由でGoogle Sheetsへ追記します。送信に失敗した測定値は本体のNVSへ保持され、再起動後も再送対象として復元されます。直近の失敗履歴もNVSに残り、シリアルモニタから確認できます。送信が終わるとWi-Fiはすぐに停止します。日本時間の `23:00-06:00` は deep sleep に入り、起床は `06:00` です。
 
 ```text
 CM3-HM scale
@@ -164,6 +164,20 @@ Discord sent
 WiFi disconnecting
 ```
 
+送信失敗や復旧状況を確認したい場合は、シリアルモニタで次のコマンドが使えます。
+
+```text
+status
+pending
+failures
+clear_failures
+help
+```
+
+- `pending`: 本体に保持されている未送信の測定値を表示
+- `failures`: 直近5件までの送信失敗履歴を表示
+- `clear_failures`: 失敗履歴を消去
+
 深夜に起動した場合は、次のようなログになります。
 
 ```text
@@ -240,6 +254,8 @@ constexpr float CALIBRATION_KG_PER_RAW_STEP = 2.9f / 11.0f;
 ### Sheetsが記録されない
 
 `DEBUG_HTTP = true` にして再アップロードし、HTTPステータスとレスポンスを確認してください。Apps Script側の `実行数` ログも確認します。
+
+電源を入れ直すと直るケースでも、失敗した1件がRAMだけに載っている実装だと消えます。このファームウェアでは未送信データと失敗履歴をNVSへ残すので、再起動後に `pending` と `failures` で確認できます。
 
 ### Apps Scriptのデプロイを更新したのに反映されない
 
